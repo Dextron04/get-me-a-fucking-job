@@ -1,3 +1,4 @@
 # get-me-a-fucking-job
 
-![alt="main-img"](https://github.com/user-attachments/assets/abe4d2b0-9497-4e4c-8acd-14f605667dce)
+
+![Generated Image March 24, 2025 - 1_30AM png](https://github.com/user-attachments/assets/4659d23c-6f70-4eb2-8daf-dcb0fba7680e)

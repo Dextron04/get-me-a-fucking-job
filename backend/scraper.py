@@ -12,6 +12,7 @@ import os
 import logging
 from selenium.common.exceptions import WebDriverException
 import subprocess
+from selenium.webdriver.common.keys import Keys
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
@@ -78,21 +79,41 @@ def safe_get_attr(element, css_selector, attr):
 
 def close_linkedin_modal(driver):
     try:
-        # Wait briefly for any modal; LinkedIn sometimes uses artdeco-dismiss on button
-        modal_close_selectors = [
+        # Try multiple strategies to dismiss sign-in modal / overlays
+        selectors = [
             "button[aria-label='Dismiss']",
-            "button[data-control-name='close']",
-            "button.artdeco-modal__dismiss"
+            "button[aria-label='Close']",
+            "button.artdeco-modal__dismiss",
+            "button[data-test-modal-close-btn]",
+            "div[role='dialog'] button[aria-label='Dismiss']",
+            "div[role='dialog'] button[aria-label='Close']"
         ]
-        for sel in modal_close_selectors:
+        dismissed = False
+        for sel in selectors:
             buttons = driver.find_elements(By.CSS_SELECTOR, sel)
             if buttons:
-                buttons[0].click()
-                logging.info("Closed pop-up (selector: %s)", sel)
-                time.sleep(1)
-                return
+                try:
+                    buttons[0].click()
+                    logging.info("Closed pop-up (selector: %s)", sel)
+                    time.sleep(0.5)
+                    dismissed = True
+                    break
+                except Exception:
+                    pass
+        if not dismissed:
+            # Send ESC key
+            try:
+                driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+                time.sleep(0.3)
+            except Exception:
+                pass
+        # If still present, force remove with JS
+        if driver.find_elements(By.CSS_SELECTOR, "div[role='dialog'], .artdeco-modal, .authentication-outlet"):
+            driver.execute_script("document.querySelectorAll('[role=\\'dialog\\'], .artdeco-modal, .authentication-outlet, .overlay, .modal-overlay, .artdeco-modal-overlay').forEach(e=>e.remove());")
+            logging.info("Forced removal of modal via JS")
+            time.sleep(0.3)
     except Exception as e:
-        logging.debug("No modal closed: %s", e)
+        logging.debug("Modal close attempt error: %s", e)
 
 
 def detect_browser_major():
@@ -160,8 +181,9 @@ def scrape_jobs(url):
 
     for idx, card in enumerate(job_cards):
         try:
+            close_linkedin_modal(driver)  # Ensure modal not blocking
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", card)
-            time.sleep(0.5)
+            time.sleep(0.4)
             card.click()
             # Wait for description panel
             try:

@@ -10,10 +10,19 @@ import json
 from datetime import datetime
 from scraper import get_csv_file
 import logging
-import google.generativeai as genai
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+    logging.warning("google-generativeai not installed; LLM analysis disabled.")
 from typing import List, Dict
 import os
 from dotenv import load_dotenv
+try:
+    from docx import Document
+except ImportError:
+    Document = None
+    logging.warning("python-docx not installed; DOCX resume parsing disabled.")
 
 # Load environment variables
 load_dotenv()
@@ -32,20 +41,36 @@ class JobAnalyzer:
         self.llm_analysis = None
         
         # Initialize Gemini
-        genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-        self.model = genai.GenerativeModel('gemini-pro')
+        if genai and os.getenv('GOOGLE_API_KEY'):
+            genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+            try:
+                self.model = genai.GenerativeModel('gemini-pro')
+            except Exception:
+                self.model = None
+                logging.warning("Failed to initialize Gemini model; continuing without LLM analysis")
+        else:
+            self.model = None
+        
+        # Path to the CSV file
+        self.csv_path = os.path.join(os.path.dirname(__file__), 'scraped_jobs.csv')
         
     def extract_text_from_pdf(self):
-        """Extract text from resume PDF"""
+        """Extract text from resume PDF or DOCX"""
         logging.info("Extracting text from resume...")
         try:
-            doc = fitz.open(self.resume_path)
-            self.resume_text = ""
-            for page in doc:
-                self.resume_text += page.get_text()
-            doc.close()
+            if self.resume_path.lower().endswith('.pdf'):
+                doc = fitz.open(self.resume_path)
+                self.resume_text = "".join(page.get_text() for page in doc)
+                doc.close()
+            elif self.resume_path.lower().endswith('.docx'):
+                if not Document:
+                    raise ImportError("python-docx not installed. Install with 'pip install python-docx'.")
+                d = Document(self.resume_path)
+                self.resume_text = "\n".join(p.text for p in d.paragraphs)
+            else:
+                raise ValueError("Unsupported resume format. Use PDF or DOCX.")
         except Exception as e:
-            logging.error(f"Error extracting text from PDF: {e}")
+            logging.error(f"Error extracting text from resume: {e}")
             raise
 
     def extract_skills(self):
@@ -85,6 +110,9 @@ class JobAnalyzer:
 
     def analyze_jobs_with_llm(self, top_jobs: List[Dict]) -> Dict:
         """Analyze jobs using Gemini for better matching and insights"""
+        if not self.model:
+            return {"disabled": True, "reason": "LLM model not available"}
+        
         logging.info("Starting LLM-based job analysis...")
         
         # Prepare the prompt for Gemini
@@ -164,7 +192,13 @@ Provide your analysis in a structured JSON format with the following fields:
         get_csv_file()
         
         # Load scraped jobs
-        self.df = pd.read_csv("scraped_jobs.csv")
+        if not os.path.exists(self.csv_path):
+            raise FileNotFoundError(f"Scraped jobs CSV not found at {self.csv_path}")
+        if os.path.getsize(self.csv_path) == 0:
+            raise ValueError("Scraped jobs CSV is empty. Scraper likely failed or was blocked.")
+        self.df = pd.read_csv(self.csv_path)
+        if self.df.empty:
+            raise ValueError("Scraped jobs CSV has no rows.")
         logging.info(f"Loaded {len(self.df)} jobs from CSV")
         
         # Prepare text for analysis
@@ -189,11 +223,12 @@ Provide your analysis in a structured JSON format with the following fields:
         self.df['match_score'] = cos_sim
         
         # Add skill match percentage
+        total_skills = max(1, len(self.skills))
         self.df['matched_skills'] = self.df['combined_text'].apply(
             lambda x: [skill for skill in self.skills if skill.lower() in x.lower()]
         )
         self.df['skill_match_percent'] = self.df['matched_skills'].apply(
-            lambda x: len(x) / len(self.skills) * 100
+            lambda x: len(x) / total_skills * 100
         )
         
         # Calculate final score
@@ -301,6 +336,8 @@ def main():
         analyzer = JobAnalyzer("Tushin_Resume.docx")
         analyzer.extract_text_from_pdf()
         analyzer.extract_skills()
+        if not analyzer.skills:
+            logging.warning("No skills extracted from resume. Matching quality may be low.")
         report = analyzer.analyze_jobs()
         
         # Print summary to console
@@ -338,8 +375,8 @@ def main():
         
         print("\nDetailed report saved to 'job_analysis_report.json'")
         
-    except FileNotFoundError:
-        print("Error: Resume file not found. Please make sure 'Tushin_Resume_2025.pdf' exists in the correct location.")
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
     except Exception as e:
         print(f"An error occurred: {str(e)}")
         logging.error(f"Error in main: {str(e)}", exc_info=True)

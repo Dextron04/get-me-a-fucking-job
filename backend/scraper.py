@@ -33,6 +33,10 @@ MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))  # hard safety cap per keyword
 _kw_conc_env = os.getenv("KEYWORD_CONCURRENCY")
 KEYWORD_CONCURRENCY = int(_kw_conc_env) if _kw_conc_env else 0  # 0 means auto = len(keywords)
 FAST_WRITE = os.getenv("FAST_WRITE", "false").lower() in ("1", "true", "yes")  # write after each page
+TARGET_JOBS_PER_KEYWORD = int(os.getenv("TARGET_JOBS_PER_KEYWORD", "1000"))
+SEE_MORE_LIMIT = int(os.getenv("SEE_MORE_LIMIT", "80"))  # max extra clicks per keyword
+SEE_MORE_MIN_DELAY = float(os.getenv("SEE_MORE_MIN_DELAY", "0.8"))
+SEE_MORE_MAX_DELAY = float(os.getenv("SEE_MORE_MAX_DELAY", "1.6"))
 
 # service = Service(executable_path="./chromedriver-mac-arm64/chromedriver")  # Not needed with undetected_chromedriver
 
@@ -202,8 +206,8 @@ def _scroll_to_load_all_jobs(driver):
     return driver.find_elements(By.CSS_SELECTOR, "div.base-card")
 
 
-def _extract_cards(driver, page_url: str):
-    """Extract job data from all currently loaded cards."""
+def _extract_cards(driver, page_url: str, keyword: str):
+    """Extract job data from all currently loaded cards. Adds keyword tag."""
     jobs_collected = 0
     job_cards = driver.find_elements(By.CSS_SELECTOR, "div.base-card")
     for idx, card in enumerate(job_cards):
@@ -239,13 +243,111 @@ def _extract_cards(driver, page_url: str):
                     "location": location,
                     "description": description,
                     "source": "LinkedIn",
-                    "page_url": page_url
+                    "page_url": page_url,
+                    "keyword": keyword
                 })
             jobs_collected += 1
         except Exception as e:
             logging.debug("Error processing card %d: %s", idx, e)
             continue
     return jobs_collected
+
+
+def _click_see_more(driver, keyword: str, seen_before: int):
+    """Click 'See more jobs' button.
+    Modes:
+      LOOP (default): legacy multi-click loop (may trigger 429)
+      SINGLE (SEE_MORE_MODE=single): one click then wait/poll for new jobs.
+    Returns number of clicks performed (1 or >1 for loop)."""
+    mode = os.getenv("SEE_MORE_MODE", "loop").lower()
+    selectors = [
+        "button[aria-label='See more jobs']",
+        "button.infinite-scroller__show-more-button",
+        "button[aria-label='Load more results']",
+        "button[data-tracking-control-name='infinite-scroller_show-more']",
+        ".infinite-scroller__show-more-button button"
+    ]
+    def locate():
+        for sel in selectors:
+            candidates = driver.find_elements(By.CSS_SELECTOR, sel)
+            if candidates:
+                return candidates[0]
+        return None
+
+    if mode != "single":
+        # fallback to previous behavior but with a safety slower delay
+        total_clicks = 0
+        last_len = len(driver.find_elements(By.CSS_SELECTOR, "div.base-card"))
+        while total_clicks < SEE_MORE_LIMIT:
+            btn = locate()
+            if not btn:
+                break
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                time.sleep(random.uniform(0.25, 0.5))
+                btn.click()
+                total_clicks += 1
+                # longer wait to avoid 429
+                time.sleep(random.uniform(SEE_MORE_MIN_DELAY*1.5, SEE_MORE_MAX_DELAY*2))
+                current_len = len(driver.find_elements(By.CSS_SELECTOR, "div.base-card"))
+                logging.info("[KW=%s] SeeMore(loop) click %d -> cards %d (prev %d)", keyword, total_clicks, current_len, last_len)
+                if current_len <= last_len:
+                    break
+                last_len = current_len
+                if current_len + seen_before >= TARGET_JOBS_PER_KEYWORD + 50:
+                    break
+            except Exception as e:
+                logging.debug("[KW=%s] SeeMore(loop) click failed: %s", keyword, e)
+                break
+        return total_clicks
+
+    # SINGLE mode
+    btn = locate()
+    if not btn:
+        return 0
+    start_len = len(driver.find_elements(By.CSS_SELECTOR, "div.base-card"))
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+        time.sleep(random.uniform(0.4, 0.8))
+        btn.click()
+        logging.info("[KW=%s] SeeMore(single) clicked; waiting for additional jobs...", keyword)
+    except Exception as e:
+        logging.debug("[KW=%s] SeeMore(single) click failed: %s", keyword, e)
+        return 0
+    # Poll for growth
+    max_cycles = int(os.getenv("SEE_MORE_WAIT_CYCLES", "12"))  # ~ up to ~ (cycles * avg interval)
+    for cycle in range(max_cycles):
+        time.sleep(random.uniform(SEE_MORE_MIN_DELAY, SEE_MORE_MAX_DELAY*1.2))
+        close_linkedin_modal(driver)
+        # gentle scroll nudge
+        try:
+            driver.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.4));")
+        except Exception:
+            pass
+        new_len = len(driver.find_elements(By.CSS_SELECTOR, "div.base-card"))
+        if new_len > start_len:
+            logging.info("[KW=%s] SeeMore(single) growth detected cycle %d -> %d cards (was %d)", keyword, cycle+1, new_len, start_len)
+            break
+        if cycle % 4 == 3:
+            logging.info("[KW=%s] SeeMore(single) still waiting (cycle %d, cards=%d)", keyword, cycle+1, new_len)
+    return 1
+
+
+def _see_more_present(driver) -> bool:
+    selectors = [
+        "button[aria-label='See more jobs']",
+        "button.infinite-scroller__show-more-button",
+        "button[aria-label='Load more results']",
+        "button[data-tracking-control-name='infinite-scroller_show-more']",
+        ".infinite-scroller__show-more-button button"
+    ]
+    for sel in selectors:
+        try:
+            if driver.find_elements(By.CSS_SELECTOR, sel):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def scrape_jobs(base_url: str, keyword: str):
@@ -290,8 +392,11 @@ def scrape_jobs(base_url: str, keyword: str):
                 logging.info("No results on page %d for '%s' (stopping)", page + 1, keyword)
                 break
             _scroll_to_load_all_jobs(driver)
+            # Initial expansion via See More if present
+            if _see_more_present(driver):
+                _click_see_more(driver, keyword, seen_before=0)
             before_count = len(all_jobs)
-            added = _extract_cards(driver, page_url)
+            added = _extract_cards(driver, page_url, keyword)
             logging.info("[KW=%s] Extract attempt page %d: added_raw=%d total_all_jobs=%d", keyword, page + 1, added, len(all_jobs))
             if added:
                 unique_buffer = []
@@ -306,10 +411,51 @@ def scrape_jobs(base_url: str, keyword: str):
                     all_jobs.extend(unique_buffer)
             after_count = len(all_jobs)
             page_new = after_count - before_count
+            # Per-keyword unique count
+            with lock:
+                keyword_total = sum(1 for j in all_jobs if j.get("keyword") == keyword)
             total_new += max(0, page_new)
-            logging.info("[KW=%s] Page %d: +%d (unique total %d)", keyword, page + 1, page_new, len(all_jobs))
-            if page_new == 0:
-                logging.info("Stagnated (no new jobs) on page %d for '%s' -> stop", page + 1, keyword)
+            logging.info("[KW=%s] Page %d: +%d (unique keyword total %d / target %d, global %d)",
+                         keyword, page + 1, page_new, keyword_total, TARGET_JOBS_PER_KEYWORD, len(all_jobs))
+            if keyword_total >= TARGET_JOBS_PER_KEYWORD:
+                logging.info("[KW=%s] Reached target (%d) -> stopping keyword scrape", keyword, TARGET_JOBS_PER_KEYWORD)
+                break
+            if page_new == 0 and keyword_total > 0:
+                # If a 'See more jobs' button is still present, attempt one more expansion cycle
+                if _see_more_present(driver):
+                    logging.info("[KW=%s] Stagnation detected but 'See more' present -> extra expansion", keyword)
+                    extra_clicks = _click_see_more(driver, keyword, seen_before=keyword_total)
+                    if extra_clicks:
+                        before_count2 = len(all_jobs)
+                        added2 = _extract_cards(driver, page_url, keyword)
+                        if added2:
+                            unique_buffer = []
+                            with lock:
+                                for job in all_jobs:
+                                    link = job.get("link")
+                                    if link and link not in seen_links:
+                                        seen_links.add(link)
+                                        unique_buffer.append(job)
+                            with lock:
+                                all_jobs.clear()
+                                all_jobs.extend(unique_buffer)
+                            after_count2 = len(all_jobs)
+                            page_new2 = after_count2 - before_count2
+                            with lock:
+                                keyword_total = sum(1 for j in all_jobs if j.get("keyword") == keyword)
+                            logging.info("[KW=%s] Extra expansion: +%d (keyword total %d)", keyword, page_new2, keyword_total)
+                            if FAST_WRITE and page_new2 > 0:
+                                _safe_write_csv(partial=True)
+                            if keyword_total >= TARGET_JOBS_PER_KEYWORD:
+                                logging.info("[KW=%s] Reached target after extra expansion", keyword)
+                                break
+                            if page_new2 > 0:
+                                # Continue to next page (treat as progress)
+                                continue
+                    # No progress after extra attempt -> break
+                    logging.info("[KW=%s] No growth after extra 'See more' cycle -> stop", keyword)
+                else:
+                    logging.info("[KW=%s] Stagnated (no 'See more' button) after page %d -> stop", keyword, page + 1)
                 break
             # Incremental write for fast feedback
             if FAST_WRITE and page_new > 0:

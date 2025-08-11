@@ -4,6 +4,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python <3.9 fallback (not expected here)
+    ZoneInfo = None
 import re
 import pandas as pd
 import time
@@ -37,6 +42,8 @@ TARGET_JOBS_PER_KEYWORD = int(os.getenv("TARGET_JOBS_PER_KEYWORD", "5000"))
 SEE_MORE_LIMIT = int(os.getenv("SEE_MORE_LIMIT", "100"))  # max extra clicks per keyword
 SEE_MORE_MIN_DELAY = float(os.getenv("SEE_MORE_MIN_DELAY", "0.8"))
 SEE_MORE_MAX_DELAY = float(os.getenv("SEE_MORE_MAX_DELAY", "1.6"))
+HARD_GLOBAL_LIMIT = int(os.getenv("HARD_GLOBAL_LIMIT", "0"))  # absolute cap across all keywords (0 = unlimited)
+STAGGER_LAUNCH_SECONDS = float(os.getenv("STAGGER_LAUNCH_SECONDS", "0"))  # delay between keyword browser launches
 
 # service = Service(executable_path="./chromedriver-mac-arm64/chromedriver")  # Not needed with undetected_chromedriver
 
@@ -46,7 +53,7 @@ job_boards = [
     "https://www.linkedin.com/jobs/search?keywords={keyword}&location=&trk=public_jobs_jobs-search-bar_search-submit&position=1&pageNum=0"
 ]
 
-keywords = ["software engineer", "software engineer intern", "software developer"]
+keywords = ["AI Research Analyst", "Software Engineer"]
 
 all_jobs = []
 
@@ -171,17 +178,39 @@ def _init_driver(url: str):
     options = build_options()
     browser_major = detect_browser_major()
     logging.info("Initializing browser for %s (detected major=%s)", url, browser_major)
+    # Attempt uc first, then manual driver fallback (particularly for Apple Silicon path issues)
     try:
         if browser_major:
             try:
                 return uc.Chrome(options=options, version_main=browser_major)
-            except WebDriverException as e:
-                logging.warning("Version-pinned launch failed (%s). Retrying without pin...", e)
-                return uc.Chrome(options=options)
-        return uc.Chrome(options=options)
+            except Exception as e:
+                logging.warning("uc version-pinned failed: %s", e)
+        # generic uc
+        try:
+            return uc.Chrome(options=options)
+        except Exception as e:
+            logging.warning("uc generic launch failed: %s", e)
     except Exception as e:
-        logging.error("Failed launching browser: %s", e)
-        return None
+        logging.warning("uc initial strategy error: %s", e)
+
+    # Manual chromedriver fallback
+    fallback_paths = [
+        os.path.join(BASE_DIR, "..", "chromedriver-mac-arm64", "chromedriver"),
+        "/usr/local/bin/chromedriver",
+        "/opt/homebrew/bin/chromedriver",
+        "/usr/bin/chromedriver"
+    ]
+    for p in fallback_paths:
+        real = os.path.abspath(p)
+        if os.path.exists(real) and os.access(real, os.X_OK):
+            try:
+                logging.info("Attempting manual Service chromedriver at %s", real)
+                service = Service(executable_path=real)
+                return webdriver.Chrome(service=service, options=options)
+            except Exception as e:
+                logging.warning("Manual chromedriver launch failed (%s): %s", real, e)
+    logging.error("Failed launching browser after uc + manual fallbacks")
+    return None
 
 
 def _scroll_to_load_all_jobs(driver):
@@ -206,8 +235,40 @@ def _scroll_to_load_all_jobs(driver):
     return driver.find_elements(By.CSS_SELECTOR, "div.base-card")
 
 
+def _parse_posted(text: str):
+    """Parse relative posted text like '2 days ago', '3 weeks ago', '1 month ago', '30+ days ago', 'Just posted'. Return (date_obj, normalized_raw)."""
+    if not text:
+        return None, ""
+    raw = text.strip()
+    t = raw.lower()
+    now = datetime.now(ZoneInfo('America/Los_Angeles')) if ZoneInfo else datetime.utcnow()
+    # Defaults
+    if 'just' in t or 'hour' in t or 'min' in t:
+        return now.date(), raw
+    # 30+ days (LinkedIn) treat as 30
+    if '30+' in t:
+        return (now - timedelta(days=30)).date(), raw
+    m = re.search(r'(\d+)\s*(day|week|month|year)', t)
+    if m:
+        val = int(m.group(1))
+        unit = m.group(2)
+        if 'day' in unit:
+            delta = timedelta(days=val)
+        elif 'week' in unit:
+            delta = timedelta(weeks=val)
+        elif 'month' in unit:
+            # Approximate month = 30 days
+            delta = timedelta(days=30*val)
+        elif 'year' in unit:
+            delta = timedelta(days=365*val)
+        else:
+            delta = timedelta(0)
+        return (now - delta).date(), raw
+    return None, raw
+
+
 def _extract_cards(driver, page_url: str, keyword: str):
-    """Extract job data from all currently loaded cards. Adds keyword tag."""
+    """Extract job data from all currently loaded cards. Adds keyword tag and posted date."""
     jobs_collected = 0
     job_cards = driver.find_elements(By.CSS_SELECTOR, "div.base-card")
     for idx, card in enumerate(job_cards):
@@ -231,6 +292,17 @@ def _extract_cards(driver, page_url: str, keyword: str):
             link = safe_get_attr(card, "a.base-card__full-link", "href")
             company = safe_get_text(card, "h4.base-search-card__subtitle")
             location = safe_get_text(card, "span.job-search-card__location")
+            # Posted date extraction
+            posted_text = ""
+            try:
+                posted_text = card.find_element(By.CSS_SELECTOR, "time").text.strip()
+            except Exception:
+                try:
+                    posted_text = safe_get_text(card, "time.job-search-card__listdate")
+                except Exception:
+                    posted_text = ""
+            posted_date_obj, posted_raw = _parse_posted(posted_text)
+            posted_date_iso = posted_date_obj.isoformat() if posted_date_obj else ""
             desc_div = soup.find("div", class_="show-more-less-html__markup")
             description = desc_div.get_text(" ", strip=True) if desc_div else "Description not available"
             if not title:
@@ -241,6 +313,8 @@ def _extract_cards(driver, page_url: str, keyword: str):
                     "link": link,
                     "company": company,
                     "location": location,
+                    "posted_raw": posted_raw or posted_text,
+                    "posted_date_pdt": posted_date_iso,
                     "description": description,
                     "source": "LinkedIn",
                     "page_url": page_url,
@@ -251,6 +325,68 @@ def _extract_cards(driver, page_url: str, keyword: str):
             logging.debug("Error processing card %d: %s", idx, e)
             continue
     return jobs_collected
+
+
+def scrape_keyword(keyword: str) -> int:
+    """Scrape a single keyword with one browser window (pagination + see more)."""
+    base_url = job_boards[0].format(keyword=keyword.replace(" ", "%20"))
+    driver = _init_driver(base_url)
+    if not driver:
+        return 0
+    logging.info("[KW=%s] Browser window launched", keyword)
+    seen_links = set()
+    total_added = 0
+    try:
+        for page in range(MAX_PAGES):
+            offset = page * 25
+            page_url = re.sub(r"pageNum=\d+", f"pageNum={page}", base_url)
+            if 'start=' in page_url:
+                page_url = re.sub(r"start=\d+", f"start={offset}", page_url)
+            else:
+                page_url = f"{page_url}&start={offset}"
+            try:
+                driver.get(page_url)
+            except Exception:
+                break
+            close_linkedin_modal(driver)
+            try:
+                WebDriverWait(driver, 8).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.base-card")))
+            except Exception:
+                break
+            _scroll_to_load_all_jobs(driver)
+            if _see_more_present(driver):
+                _click_see_more(driver, keyword, seen_before=0)
+            before = len(all_jobs)
+            added_raw = _extract_cards(driver, page_url, keyword)
+            if added_raw:
+                unique_buffer = []
+                with lock:
+                    for job in all_jobs:
+                        link = job.get("link")
+                        if link and link not in seen_links:
+                            seen_links.add(link); unique_buffer.append(job)
+                with lock:
+                    all_jobs.clear(); all_jobs.extend(unique_buffer)
+            after = len(all_jobs)
+            page_new = after - before
+            total_added += max(0, page_new)
+            with lock:
+                kw_total = sum(1 for j in all_jobs if j.get("keyword") == keyword)
+            if TARGET_JOBS_PER_KEYWORD and kw_total >= TARGET_JOBS_PER_KEYWORD:
+                break
+            if HARD_GLOBAL_LIMIT and len(all_jobs) >= HARD_GLOBAL_LIMIT:
+                break
+            if page_new == 0 and kw_total > 0:
+                break
+            if FAST_WRITE and page_new > 0:
+                _safe_write_csv(partial=True)
+    finally:
+        if not DEBUG_MODE:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+    return total_added
 
 
 def _click_see_more(driver, keyword: str, seen_before: int):
@@ -350,125 +486,6 @@ def _see_more_present(driver) -> bool:
     return False
 
 
-def scrape_jobs(base_url: str, keyword: str):
-    """Paginate & scroll through LinkedIn job results for a keyword using a single browser instance."""
-    driver = _init_driver(base_url)
-    if not driver:
-        return 0
-    driver.set_page_load_timeout(60)
-    seen_links = set()
-    total_new = 0
-    try:
-        for page in range(MAX_PAGES):
-            offset = page * 25
-            if "start=" in base_url:
-                page_url = re.sub(r"start=\d+", f"start={offset}", base_url)
-            else:
-                page_url = base_url
-                page_url = re.sub(r"pageNum=\d+", f"pageNum={page}", page_url)
-                if 'start=' not in page_url:
-                    page_url = f"{page_url}&start={offset}"
-            logging.info("[KW=%s] Page %d -> %s", keyword, page + 1, page_url)
-            try:
-                driver.get(page_url)
-                logging.info("[KW=%s] Loaded URL current_url=%s", keyword, driver.current_url)
-            except Exception as e:
-                logging.error("Page load failed (%s): %s", page_url, e)
-                break
-            time.sleep(random.uniform(1.0, 2.0))
-            close_linkedin_modal(driver)
-            # Debug dump early if no cards yet and DEBUG_MODE
-            if DEBUG_MODE:
-                try:
-                    with open(os.path.join(BASE_DIR, f'debug_{keyword}_page{page+1}.html'), 'w') as f:
-                        f.write(driver.page_source)
-                except Exception:
-                    pass
-            try:
-                WebDriverWait(driver, 12).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.base-card"))
-                )
-            except Exception:
-                logging.info("No results on page %d for '%s' (stopping)", page + 1, keyword)
-                break
-            _scroll_to_load_all_jobs(driver)
-            # Initial expansion via See More if present
-            if _see_more_present(driver):
-                _click_see_more(driver, keyword, seen_before=0)
-            before_count = len(all_jobs)
-            added = _extract_cards(driver, page_url, keyword)
-            logging.info("[KW=%s] Extract attempt page %d: added_raw=%d total_all_jobs=%d", keyword, page + 1, added, len(all_jobs))
-            if added:
-                unique_buffer = []
-                with lock:
-                    for job in all_jobs:
-                        link = job.get("link")
-                        if link and link not in seen_links:
-                            seen_links.add(link)
-                            unique_buffer.append(job)
-                with lock:
-                    all_jobs.clear()
-                    all_jobs.extend(unique_buffer)
-            after_count = len(all_jobs)
-            page_new = after_count - before_count
-            # Per-keyword unique count
-            with lock:
-                keyword_total = sum(1 for j in all_jobs if j.get("keyword") == keyword)
-            total_new += max(0, page_new)
-            logging.info("[KW=%s] Page %d: +%d (unique keyword total %d / target %d, global %d)",
-                         keyword, page + 1, page_new, keyword_total, TARGET_JOBS_PER_KEYWORD, len(all_jobs))
-            if keyword_total >= TARGET_JOBS_PER_KEYWORD:
-                logging.info("[KW=%s] Reached target (%d) -> stopping keyword scrape", keyword, TARGET_JOBS_PER_KEYWORD)
-                break
-            if page_new == 0 and keyword_total > 0:
-                # If a 'See more jobs' button is still present, attempt one more expansion cycle
-                if _see_more_present(driver):
-                    logging.info("[KW=%s] Stagnation detected but 'See more' present -> extra expansion", keyword)
-                    extra_clicks = _click_see_more(driver, keyword, seen_before=keyword_total)
-                    if extra_clicks:
-                        before_count2 = len(all_jobs)
-                        added2 = _extract_cards(driver, page_url, keyword)
-                        if added2:
-                            unique_buffer = []
-                            with lock:
-                                for job in all_jobs:
-                                    link = job.get("link")
-                                    if link and link not in seen_links:
-                                        seen_links.add(link)
-                                        unique_buffer.append(job)
-                            with lock:
-                                all_jobs.clear()
-                                all_jobs.extend(unique_buffer)
-                            after_count2 = len(all_jobs)
-                            page_new2 = after_count2 - before_count2
-                            with lock:
-                                keyword_total = sum(1 for j in all_jobs if j.get("keyword") == keyword)
-                            logging.info("[KW=%s] Extra expansion: +%d (keyword total %d)", keyword, page_new2, keyword_total)
-                            if FAST_WRITE and page_new2 > 0:
-                                _safe_write_csv(partial=True)
-                            if keyword_total >= TARGET_JOBS_PER_KEYWORD:
-                                logging.info("[KW=%s] Reached target after extra expansion", keyword)
-                                break
-                            if page_new2 > 0:
-                                # Continue to next page (treat as progress)
-                                continue
-                    # No progress after extra attempt -> break
-                    logging.info("[KW=%s] No growth after extra 'See more' cycle -> stop", keyword)
-                else:
-                    logging.info("[KW=%s] Stagnated (no 'See more' button) after page %d -> stop", keyword, page + 1)
-                break
-            # Incremental write for fast feedback
-            if FAST_WRITE and page_new > 0:
-                _safe_write_csv(partial=True)
-    finally:
-        if not DEBUG_MODE:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-        else:
-            logging.info("DEBUG_MODE: browser left open for keyword '%s'", keyword)
-    return total_new
 
 
 def _safe_write_csv(partial: bool = False):
@@ -493,20 +510,19 @@ def get_csv_file():
     logging.info("Starting scrape for %d keywords (concurrency=%d, max_pages=%d, fast_write=%s)",
                  len(keywords), effective_conc, MAX_PAGES, FAST_WRITE)
 
-    def run_keyword(kw: str):
-        total_for_kw = 0
-        for board in job_boards:
-            base = board.format(keyword=kw.replace(" ", "%20"))
-            new_count = scrape_jobs(base, kw)
-            total_for_kw += new_count
-        logging.info("[KW=%s] Finished with %d new jobs (cumulative global=%d)", kw, total_for_kw, len(all_jobs))
+    def run_keyword(args):
+        idx, kw = args
+        if STAGGER_LAUNCH_SECONDS and idx > 0:
+            time.sleep(STAGGER_LAUNCH_SECONDS * idx)
+        new_count = scrape_keyword(kw)
+        logging.info("[KW=%s] Finished with %d new jobs (global=%d)", kw, new_count, len(all_jobs))
 
     if effective_conc > 1:
         with ThreadPoolExecutor(max_workers=effective_conc) as executor:
-            list(executor.map(run_keyword, keywords))
+            list(executor.map(run_keyword, enumerate(keywords)))
     else:
-        for kw in keywords:
-            run_keyword(kw)
+        for idx, kw in enumerate(keywords):
+            run_keyword((idx, kw))
 
     if not all_jobs:
         logging.warning("No jobs collected. LinkedIn may have blocked access or layout changed.")

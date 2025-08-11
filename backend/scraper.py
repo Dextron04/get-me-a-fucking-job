@@ -24,7 +24,7 @@ brave_path = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
 HEADLESS = os.getenv("HEADLESS", "false").lower() in ["1", "true", "yes"]
 DEBUG_MODE = os.getenv("SCRAPER_DEBUG", "false").lower() in ["1", "true", "yes"]
 # Scrolling / pagination tuning (env overridable)
-MAX_SCROLL_ATTEMPTS = int(os.getenv("MAX_SCROLL_ATTEMPTS", "60"))  # per page
+MAX_SCROLL_ATTEMPTS = int(os.getenv("MAX_SCROLL_ATTEMPTS", "100"))  # per page
 SCROLL_STAGNATION_LIMIT = int(os.getenv("SCROLL_STAGNATION_LIMIT", "4"))  # consecutive no-growth scrolls
 SCROLL_MIN_DELAY = float(os.getenv("SCROLL_MIN_DELAY", "0.6"))
 SCROLL_MAX_DELAY = float(os.getenv("SCROLL_MAX_DELAY", "1.4"))
@@ -33,8 +33,8 @@ MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))  # hard safety cap per keyword
 _kw_conc_env = os.getenv("KEYWORD_CONCURRENCY")
 KEYWORD_CONCURRENCY = int(_kw_conc_env) if _kw_conc_env else 0  # 0 means auto = len(keywords)
 FAST_WRITE = os.getenv("FAST_WRITE", "false").lower() in ("1", "true", "yes")  # write after each page
-TARGET_JOBS_PER_KEYWORD = int(os.getenv("TARGET_JOBS_PER_KEYWORD", "1000"))
-SEE_MORE_LIMIT = int(os.getenv("SEE_MORE_LIMIT", "80"))  # max extra clicks per keyword
+TARGET_JOBS_PER_KEYWORD = int(os.getenv("TARGET_JOBS_PER_KEYWORD", "5000"))
+SEE_MORE_LIMIT = int(os.getenv("SEE_MORE_LIMIT", "100"))  # max extra clicks per keyword
 SEE_MORE_MIN_DELAY = float(os.getenv("SEE_MORE_MIN_DELAY", "0.8"))
 SEE_MORE_MAX_DELAY = float(os.getenv("SEE_MORE_MAX_DELAY", "1.6"))
 

@@ -1,0 +1,27 @@
+# Core NLP & ML
+spacy
+# Small English model (can alternatively run: python -m spacy download en_core_web_sm)
+# en-core-web-sm
+scikit-learn
+pandas
+numpy
+
+# PDF & DOCX parsing
+PyMuPDF
+python-docx
+
+# Environment variables
+python-dotenv
+
+# Web scraping / automation
+selenium
+undetected-chromedriver
+beautifulsoup4
+
+# Generative AI (optional LLM analysis)
+google-generativeai
+
+# Notes:
+# - Versions are intentionally unpinned; pin them after testing for reproducibility.
+# - If en-core-web-sm installation via requirements fails, remove that line and run:
+#     python -m spacy download en_core_web_sm
